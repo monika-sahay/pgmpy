@@ -28,7 +28,7 @@ from pgmpy.estimators.base import MarginalEstimator
 from pgmpy.estimators.MirrorDescentEstimator import MirrorDescentEstimator
 from pgmpy.estimators.expert import ExpertInLoop
 from pgmpy.estimators.GES import GES
-from pgmpy.estimators.DirectLingam import DirectLiNGAMEstimator
+from pgmpy.estimators.DirectLiNGAMEstimator import DirectLiNGAMEstimator
 
 __all__ = [
     "BaseEstimator",

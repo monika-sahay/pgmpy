@@ -3,12 +3,7 @@ import pandas as pd
 from pgmpy.estimators import DirectLiNGAMEstimator
 import matplotlib.pyplot as plt
 import networkx as nx
-
-
-
-
-
-
+import pytest
 
 def test_direct_lingam_nonlinear_fails_gracefully():
     rng = np.random.default_rng(0)
@@ -21,7 +16,7 @@ def test_direct_lingam_nonlinear_fails_gracefully():
     est = DirectLiNGAMEstimator(df)
     model = est.estimate()
 
-    # ✅ Fails gracefully = produces too many edges or random structure
+    # Fails gracefully = produces too many edges or random structure
     print(len(model.edges()))
     assert len(model.edges()) > 0, "Model should return some edges, even if assumptions are violated"
 
@@ -42,7 +37,7 @@ def test_direct_lingam_with_high_noise():
 
 def test_direct_lingam_independent_variables():
     rng = np.random.default_rng(123)
-    n = 300  # increased sample size for stability
+    n = 1000  # increased sample size for stability
     x1 = rng.normal(size=n)
     x2 = rng.normal(size=n)
     x3 = rng.normal(size=n)
@@ -116,3 +111,41 @@ def test_stability_selection_finds_stable_edge():
     print(f"Stable edges: {edges}")
 
     assert ("X1", "X2") in edges or ("X2", "X1") in edges
+
+
+
+def test_direct_lingam_on_adult():
+    df = pd.read_csv("pgmpy/tests/test_estimators/testdata/adult.csv")
+
+    # Convert categorical variables to numeric
+    df_numeric = pd.get_dummies(df, drop_first=True)
+
+    # Optional: Select a subset (to keep it small & interpretable)
+    df_numeric = df_numeric.iloc[:500]
+
+    est = DirectLiNGAMEstimator(df_numeric, threshold=0.05, reps=300)
+    model = est.estimate()
+
+    print("Inferred edges:", list(model.edges()))
+    assert len(model.edges()) > 0
+
+
+def test_required_and_forbidden_edges():
+    df = generate_data()
+    required = {("X1", "X2")}
+    forbidden = {("X2", "X1")}
+
+    est = DirectLiNGAMEstimator(df, required_edges=required, forbidden_edges=forbidden)
+    model = est.estimate()
+
+    assert ("X1", "X2") in model.edges()
+    assert ("X2", "X1") not in model.edges()
+
+
+
+def test_contradictory_constraints():
+    df = generate_data()
+    required = {("X1", "X2")}
+    forbidden = {("X1", "X2")}  # contradiction
+    with pytest.raises(ValueError):
+        DirectLiNGAMEstimator(df, required_edges=required, forbidden_edges=forbidden).estimate()
