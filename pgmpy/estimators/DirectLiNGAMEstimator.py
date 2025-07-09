@@ -1,276 +1,415 @@
-# pgmpy/estimaors/DirectLinGameEstimator.py
 import numpy as np
 import pandas as pd
-from pgmpy.base import DAG
-from sklearn.linear_model import Lasso
-from hyppo.independence import Hsic
-from sklearn.preprocessing import StandardScaler
 from collections import Counter
 from scipy.stats import kurtosis
-import networkx as nx
+from sklearn.linear_model import Lasso
+from sklearn.preprocessing import StandardScaler
+from pgmpy.base import DAG
+from pgmpy.estimators import BaseEstimator
+from hyppo.independence import Hsic
 
 
-def hsic_test(x, y, threshold=0.05, reps=1000, verbose=False):
-    hsic = Hsic()
-    stat, pval = hsic.test(x, y, reps=reps)
-    if verbose:
-        print(f"HSIC p-value = {pval:.4f}, threshold = {threshold}")
-    return pval
+def hsic_test(x, y, threshold=0.1, reps=500):
+    hsic = Hsic(threshold=threshold)
+    try:
+        stat, pval = hsic.test(x, y, reps=reps)
+    except Exception:
+        return 0.0, 1.0
+    return stat, pval
 
 
-class DirectLiNGAMEstimator:
-    def __init__(self, data: pd.DataFrame, threshold=0.05, reps=1000, verbose=False,
-                 forbidden_edges=None, required_edges=None):
-        self.data = pd.DataFrame(StandardScaler().fit_transform(data), columns=data.columns)
-        self.variables = list(data.columns)
+class DirectLiNGAMEstimator(BaseEstimator):
+    def __init__(self, data, threshold=0.05, reps=1000,
+                 forbidden_edges=None, required_edges=None, verbose=False):
+        super().__init__(data)
+        self.data = pd.DataFrame(StandardScaler().fit_transform(data), columns=self.variables)
         self.threshold = threshold
         self.reps = reps
         self.verbose = verbose
-        self.model = DAG()
-        self.forbidden_edges = set(forbidden_edges or [])
         self.required_edges = set(required_edges or [])
+        self.forbidden_edges = set(forbidden_edges or [])
+        self.model = None
         self.latent_confounds_ = []
 
-        conflict = self.required_edges & self.forbidden_edges
-        if conflict:
-            raise ValueError(f"Contradictory constraints found: {conflict}")
+        if self.required_edges & self.forbidden_edges:
+            raise ValueError("Conflicting constraints: same edge in required and forbidden sets.")
 
     def _is_exogenous(self, x, rest):
         if not rest:
             return True
         x_data = self.data[x].values
-        if kurtosis(x_data) < 3:
-            if self.verbose:
-                print(f"⚠️ {x} is too Gaussian-like; skipping.")
-            return False
-        rest_data = self.data[rest].values
+        if abs(kurtosis(x_data)) < 0.2:
+            return True
+        rest_data = self.data[list(rest)].values
+        # regress x on rest
         reg = Lasso(alpha=0.01).fit(rest_data, x_data)
         residuals = x_data - reg.predict(rest_data)
+        # test residuals for independence with each rest var
         pvals = []
         for i in range(rest_data.shape[1]):
-            p = hsic_test(residuals.reshape(-1, 1), rest_data[:, i].reshape(-1, 1),
-                          threshold=self.threshold, reps=self.reps, verbose=self.verbose)
+            p = hsic_test(residuals.reshape(-1,1), rest_data[:,i].reshape(-1,1),
+                          threshold=self.threshold, reps=self.reps)
             pvals.append(p)
+        # exogenous if most residual-vs-var tests show independence
+        return np.mean(np.array(pvals) > self.threshold) >= 0.8
+    
+    def fit(self, direction_delta=0.2, bootstrap=False, n_runs=5, min_freq=0.5, fail_gracefully=True):
+        # Validate conflicting directed constraints
+        for u, v in self.required_edges:
+            if (v, u) in self.forbidden_edges:
+                raise ValueError(f"Conflict: Required edge {u}→{v} contradicts forbidden edge {v}→{u}")
 
-        pass_rate = sum(p > self.threshold for p in pvals) / len(pvals)
-        return pass_rate >= 0.8
+        self.latent_confounds_ = []
 
-    def estimate(self, direction_delta=0.2, fail_gracefully=True):
-        ordered_vars = []
-        if self.required_edges:
-            forced_vars = set(src for src, _ in self.required_edges)
-            ordered_vars.extend(forced_vars)
-            remaining = set(self.variables) - forced_vars
+        if bootstrap:
+            return self._fit_ensemble(n_runs=n_runs, min_freq=min_freq, direction_delta=direction_delta)
         else:
-            remaining = set(self.variables)
+            return self._fit_once(direction_delta=direction_delta, fail_gracefully=fail_gracefully)
 
-        # Gaussian check fallback: skip all edges if all variables ~Gaussian
-        if all(np.abs(kurtosis(self.data.values, axis=0) - 3) < 0.2):
+    def _fit_once(self, direction_delta=0.2, fail_gracefully=True):
+        remaining = set(self.variables)
+        ordered = []
+
+        # if all variables are near-Gaussian, skip to empty DAG
+        if np.all(np.abs(kurtosis(self.data.values, axis=0)) < 0.2):
             if self.verbose:
-                print("All variables are Gaussian-like. Returning empty DAG.")
-            return DAG()
-        confounder_pairs = []
+                print("All variables Gaussian-like; skipping.")
+            dag = DAG()
+            dag.add_nodes_from(self.variables)
+            self.model = dag
+            return self
+
+        # find a causal ordering by peeling off 'exogenous' vars
         while remaining:
-            found = False
             for var in list(remaining):
-                others = list(remaining - {var})
-                if self._is_exogenous(var, others):
-                    ordered_vars.append(var)
+                if self._is_exogenous(var, remaining - {var}):
+                    ordered.append(var)
                     remaining.remove(var)
-                    found = True
                     break
-            if not found:
+            else:
+                # fallback to full graph, but enforce constraints
                 if fail_gracefully:
-                    if self.verbose:
-                        print("⚠️ Falling back due to nonlinear or cyclic structure.")
-                    self.model = DAG()
-                    self.model.add_nodes_from(self.variables)
-                    for i in range(len(self.variables)):
-                        for j in range(len(self.variables)):
-                            if i != j:
-                                self.model.add_edge(self.variables[i], self.variables[j])
+                    dag = self._fallback_dag()
+                    # enforce forbidden/required on fallback
+                    for u,v in self.forbidden_edges:
+                        if dag.has_edge(u,v):
+                            dag.remove_edge(u,v)
+                    for u,v in self.required_edges:
+                        if not dag.has_edge(u,v):
+                            dag.add_edge(u,v)
+                    self.model = dag
+                    return self
+                raise RuntimeError("Could not find an exogenous variable; model may not be identifiable.")
 
-                    corr_matrix = np.corrcoef(self.data.T)
-                    prune_threshold = 0.05
-                    to_remove = []
-                    for i, src in enumerate(self.variables):
-                        for j, tgt in enumerate(self.variables):
-                            if i != j and abs(corr_matrix[i][j]) < prune_threshold:
-                                to_remove.append((src, tgt))
-                    for edge in to_remove:
-                        if self.model.has_edge(*edge):
-                            self.model.remove_edge(*edge)
-
-                    # Remove forbidden edges explicitly
-                    for edge in list(self.model.edges()):
-                        if edge in self.forbidden_edges:
-                            self.model.remove_edge(*edge)
-                    return self.model
-                else:
-                    if self.verbose:
-                        print("No exogenous variable found — likely nonlinear or cyclic structure.")
-                    raise RuntimeError("Model assumption violated: No exogenous variable found.", print(self.model.edges()))
-
-        for i in range(1, len(ordered_vars)):
+        # build adjacency by pairwise HSIC-based orientation
+        n = len(self.variables)
+        idx = {v:i for i,v in enumerate(self.variables)}
+        adj = np.zeros((n,n))
+        for i in range(1,len(ordered)):
             for j in range(i):
-                src = ordered_vars[j]
-                tgt = ordered_vars[i]
-                x = self.data[src].values.reshape(-1, 1)
-                y = self.data[tgt].values.reshape(-1, 1)
-                reg1 = Lasso(alpha=0.01).fit(x, y)
-                resid1 = y - reg1.predict(x)
-                pval1 = hsic_test(resid1, x, threshold=self.threshold, reps=self.reps, verbose=self.verbose)
+                X, Y = ordered[j], ordered[i]
+                if (X,Y) in self.forbidden_edges or (Y,X) in self.forbidden_edges:
+                    continue
+                x = self.data[X].values.reshape(-1,1)
+                y = self.data[Y].values.reshape(-1,1)
+                r1 = y - Lasso(alpha=0.01).fit(x,y).predict(x)
+                r2 = x - Lasso(alpha=0.01).fit(y,x).predict(y)
+                p1_stat, p1_pval = hsic_test(r1.reshape(-1,1), x)
+                p2_stat, p2_pval = hsic_test(r2.reshape(-1,1), y)
+                # strict test
+                if p1_pval > p2_pval and (p1_pval - p2_pval) > direction_delta and p1_pval > self.threshold:
+                    adj[idx[X],idx[Y]] = 1
+                elif p2_pval > p1_pval and (p2_pval - p1_pval) > direction_delta and p2_pval > self.threshold:
+                    adj[idx[Y],idx[X]] = 1
+                elif p1_pval > self.threshold and p2_pval > self.threshold:
+                    if p1_pval > p2_pval:
+                        adj[idx[X],idx[Y]] = 1
+                    elif p2_pval > p1_pval:
+                        adj[idx[Y],idx[X]] = 1
 
-                reg2 = Lasso(alpha=0.01).fit(y, x)
-                resid2 = x - reg2.predict(y)
-                pval2 = hsic_test(resid2, y, threshold=self.threshold, reps=self.reps, verbose=self.verbose)
+        # enforce constraints on adjacency
+        for u,v in self.forbidden_edges:
+            adj[idx[u],idx[v]] = 0
+        for u,v in self.required_edges:
+            adj[idx[u],idx[v]] = 1
 
-                if pval1 > pval2 and (pval1 - pval2) > direction_delta and pval1 > self.threshold:
-                    self.model.add_edge(src, tgt)
-                elif pval2 > pval1 and (pval2 - pval1) > direction_delta and pval2 > self.threshold:
-                    self.model.add_edge(tgt, src)
-           
-            for u, v in list(self.model.edges()):
-                if self.model.has_edge(v, u):
-                    self.model.remove_edge(u, v)
-                    self.model.remove_edge(v, u)
-                    confounder_pairs.append((u, v))
+        # build final DAG
+        dag = DAG()
+        dag.add_nodes_from(self.variables)
+        for u in self.variables:
+            for v in self.variables:
+                if adj[idx[u],idx[v]] == 1:
+                    dag.add_edge(u,v)
+        # remove bidirs as latent confounds
+        for u,v in list(dag.edges()):
+            if dag.has_edge(v,u):
+                dag.remove_edge(u,v)
+                dag.remove_edge(v,u)
+                self.latent_confounds_.append((u,v))
+        # final forbidden cleanup
+        for u,v in self.forbidden_edges:
+            if dag.has_edge(u,v):
+                dag.remove_edge(u,v)
+        self.model = dag
+        return self
 
-            if confounder_pairs:
-                print("⚠️ Suspected latent confounders (removed bidirectional edges):", confounder_pairs)
-            
-        self.latent_confounds_ = confounder_pairs
-
-        for (src, dst) in self.required_edges:
-            if src in self.variables and dst in self.variables:
-                if not self.model.has_edge(src, dst):
-                    if self.verbose:
-                        print(f"Forcing required edge: {src} → {dst}")
-                    self.model.add_edge(src, dst)
-
-        for edge in list(self.model.edges()):
-            if edge in self.forbidden_edges:
-                if self.verbose:
-                    print(f"Removing forbidden edge: {edge}")
-                self.model.remove_edge(*edge)
-
-        return self.model
-
-    def ensemble_estimate(self, n_runs=5, min_freq=0.5):
+    def _fit_ensemble(self, n_runs=5, min_freq=0.5, direction_delta=0.2):
         all_edges = []
         for _ in range(n_runs):
+            idx = np.random.choice(len(self.data), size=len(self.data), replace=True)
+            sample = self.data.iloc[idx].reset_index(drop=True)
             try:
-                self.model = DAG()
-                model = self.estimate()
-                all_edges.extend(model.edges())
-            except RuntimeError:
-                continue
-
-        if not all_edges and self.verbose:
-            print("No edges in ensemble runs")
-
-        edge_counts = Counter(all_edges)
-        final_edges = [edge for edge, count in edge_counts.items() if count / n_runs >= min_freq]
-
-        final_model = DAG()
-        final_model.add_nodes_from(self.variables)
-        final_model.add_edges_from(final_edges)
-        return final_model
-    
-    def get_probabilistic_adjacency(self, all_edges, n_bootstrap):
-        matrix = pd.DataFrame(0, index=self.variables, columns=self.variables)
-        for (src, tgt) in all_edges:
-            matrix.loc[src, tgt] += 1
-        matrix = matrix / n_bootstrap
-        return matrix
-
-    def stability_selection(self, n_bootstrap=100, freq_threshold=0.7):
-        all_edges = []
-        n = len(self.data)
-        for _ in range(n_bootstrap):
-            idx = np.random.choice(n, size=n, replace=True)
-            df_sample = self.data.iloc[idx].reset_index(drop=True)
-            try:
-                est = DirectLiNGAMEstimator(df_sample,
-                                            threshold=self.threshold,
+                est = DirectLiNGAMEstimator(sample, threshold=self.threshold,
                                             reps=self.reps,
-                                            forbidden_edges=self.forbidden_edges,
                                             required_edges=self.required_edges,
-                                            verbose=False)
-                model = est.estimate(fail_gracefully=True)
-                all_edges.extend(model.edges())
+                                            forbidden_edges=self.forbidden_edges)
+                est.fit()
+                all_edges.extend(est.model.edges())
             except RuntimeError:
                 continue
+        counts = Counter(all_edges)
+        dag = DAG()
+        dag.add_nodes_from(self.variables)
+        for edge,c in counts.items():
+            if c / n_runs >= min_freq:
+                dag.add_edge(*edge)
+        for u,v in self.forbidden_edges:
+            if dag.has_edge(u,v):
+                dag.remove_edge(u,v)
+        self.model = dag
+        return self
 
-        edge_counts = Counter(all_edges)
-        print("Top stable edges:", edge_counts.most_common(10))
-        stable_edges = [edge for edge, count in edge_counts.items()
-                        if count / n_bootstrap >= freq_threshold]
-        weak_edges = [edge for edge, count in edge_counts.items() if 0.3 <= count / n_bootstrap < freq_threshold]
-        print("\n🔍 Weak signal edges (below threshold):")
-        for edge in weak_edges:
-            print(edge, f"→ {edge_counts[edge]}/{n_bootstrap}")
-        self.p_adj_matrix_ = self.get_probabilistic_adjacency(all_edges, n_bootstrap)
+    def stability_selection(self, n_bootstrap=20, freq_threshold=0.5):
+        all_edges = []
+        for _ in range(n_bootstrap):
+            sample = self.data.sample(frac=0.9, replace=True)
+            est = DirectLiNGAMEstimator(sample,
+                                        threshold=self.threshold,
+                                        reps=self.reps,
+                                        required_edges=self.required_edges,
+                                        forbidden_edges=self.forbidden_edges)
+            est.fit()
+            all_edges.extend(est.model.edges())
+        freqs = pd.Series(all_edges).value_counts() / n_bootstrap
+        sel = [tuple(e) for e in freqs[freqs >= freq_threshold].index]
+        dag = DAG()
+        dag.add_nodes_from(self.variables)
+        dag.add_edges_from(sel)
+        for u,v in self.forbidden_edges:
+            if dag.has_edge(u,v):
+                dag.remove_edge(u,v)
+        return dag
 
-        stable_model = DAG()
-        stable_model.add_nodes_from(self.variables)
-        stable_model.add_edges_from(stable_edges)
-        
-        return stable_model
+    def _fallback_dag(self):
+        dag = DAG()
+        dag.add_nodes_from(self.variables)
+        for i in self.variables:
+            for j in self.variables:
+                if i != j:
+                    dag.add_edge(i,j)
+        return dag
+
+    def get_model(self):
+        return self.model
+
+    def get_adjacency_matrix(self):
+        idx = {v:i for i,v in enumerate(self.variables)}
+        mat = np.zeros((len(idx),len(idx)))
+        for u,v in self.model.edges():
+            mat[idx[u],idx[v]] = 1
+        return mat
+
+
+
+
+
+
+# import numpy as np
+# import pandas as pd
+# from collections import Counter
+# from scipy.stats import kurtosis
+# from sklearn.linear_model import Lasso
+# from sklearn.preprocessing import StandardScaler
+# from pgmpy.base import DAG
+# from pgmpy.estimators import BaseEstimator
+# from hyppo.independence import Hsic
+
+
+# def hsic_test(x, y, threshold=0.05, reps=1000):
+#     hsic = Hsic()
+#     stat, pval = hsic.test(x, y, reps=reps)
+#     return pval
+
+
+# class DirectLiNGAMEstimator(BaseEstimator):
+#     def __init__(self, data, threshold=0.05, reps=1000,
+#                  forbidden_edges=None, required_edges=None, verbose=False):
+#         super().__init__(data)
+#         self.data = pd.DataFrame(StandardScaler().fit_transform(data), columns=self.variables)
+#         self.threshold = threshold
+#         self.reps = reps
+#         self.verbose = verbose
+#         self.required_edges = set(required_edges or [])
+#         self.forbidden_edges = set(forbidden_edges or [])
+#         self.model = None
+#         self.latent_confounds_ = []
+
+#         if self.required_edges & self.forbidden_edges:
+#             raise ValueError("Conflicting constraints: same edge in required and forbidden sets.")
+
+#     def _is_exogenous(self, x, rest):
+#         if not rest:
+#             return True
+#         x_data = self.data[x].values
+#         if abs(kurtosis(x_data) - 3) < 0.2:
+#             return True
+#         rest_data = self.data[rest].values
+#         reg = Lasso(alpha=0.01).fit(rest_data, x_data)
+#         residuals = x_data - reg.predict(rest_data)
+#         pvals = [hsic_test(residuals.reshape(-1, 1), rest_data[:, i].reshape(-1, 1),
+#                            threshold=self.threshold, reps=self.reps)
+#                  for i in range(rest_data.shape[1])]
+#         return np.mean(np.array(pvals) > self.threshold) >= 0.8
+
+#     def fit(self, direction_delta=0.2, bootstrap=False, n_runs=5, min_freq=0.5, fail_gracefully=True):
+#         if bootstrap:
+#             return self._fit_ensemble(n_runs=n_runs, min_freq=min_freq)
+#         else:
+#             return self._fit_once(direction_delta, fail_gracefully)
+
+#     def _fit_once(self, direction_delta=0.2, fail_gracefully=True):
+#         remaining = set(self.variables)
+#         ordered = []
+
+#         if all(np.abs(kurtosis(self.data.values, axis=0) - 3) < 0.2):
+#             if self.verbose:
+#                 print("All variables Gaussian-like; skipping.")
+#             self.model = DAG()
+#             self.model.add_nodes_from(self.variables)
+#             return self
+
+#         while remaining:
+#             for var in list(remaining):
+#                 others = list(remaining - {var})
+#                 if self._is_exogenous(var, others):
+#                     ordered.append(var)
+#                     remaining.remove(var)
+#                     break
+#             else:
+#                 if fail_gracefully:
+#                     self.model = self._fallback_dag()
+#                     return self
+#                 raise RuntimeError("Could not find exogenous variable")
+
+#         dag = DAG()
+#         dag.add_nodes_from(self.variables)
+
+#         for i in range(1, len(ordered)):
+#             for j in range(i):
+#                 X, Y = ordered[j], ordered[i]
+#                 x, y = self.data[X].values.reshape(-1, 1), self.data[Y].values.reshape(-1, 1)
+#                 resid1 = y - Lasso(alpha=0.01).fit(x, y).predict(x).reshape(-1, 1)
+#                 resid2 = x - Lasso(alpha=0.01).fit(y, x).predict(y).reshape(-1, 1)
+#                 pval1, pval2 = hsic_test(resid1, x), hsic_test(resid2, y)
+
+#                 if pval1 > pval2 and (pval1 - pval2) > direction_delta and pval1 > self.threshold:
+#                     dag.add_edge(X, Y)
+#                 elif pval2 > pval1 and (pval2 - pval1) > direction_delta and pval2 > self.threshold:
+#                     dag.add_edge(Y, X)
+
+#         for u, v in list(dag.edges()):
+#             if dag.has_edge(v, u):
+#                 dag.remove_edge(u, v)
+#                 dag.remove_edge(v, u)
+#                 self.latent_confounds_.append((u, v))
+
+#         for (u, v) in self.required_edges:
+#             dag.add_edge(u, v)
+
+#         # Final cleanup: ensure forbidden edges are removed
+#         for (u, v) in self.forbidden_edges:
+#             if dag.has_edge(u, v):
+#                 dag.remove_edge(u, v)
+
+#         self.model = dag
+#         return self
+
+#     def _fit_ensemble(self, n_runs=5, min_freq=0.5):
+#         all_edges = []
+#         for _ in range(n_runs):
+#             idx = np.random.choice(len(self.data), size=len(self.data), replace=True)
+#             sample = self.data.iloc[idx].reset_index(drop=True)
+#             try:
+#                 est = DirectLiNGAMEstimator(sample,
+#                                             threshold=self.threshold,
+#                                             reps=self.reps,
+#                                             required_edges=self.required_edges,
+#                                             forbidden_edges=self.forbidden_edges)
+#                 est = est.fit()
+#                 all_edges.extend(est.model.edges())
+#             except RuntimeError:
+#                 continue
+
+#         edge_counts = Counter(all_edges)
+#         final_edges = [e for e, c in edge_counts.items() if c / n_runs >= min_freq]
+#         dag = DAG()
+#         dag.add_nodes_from(self.variables)
+#         dag.add_edges_from(final_edges)
+
+#         for (u, v) in self.forbidden_edges:
+#             if dag.has_edge(u, v):
+#                 dag.remove_edge(u, v)
+
+#         self.model = dag
+#         return self
     
+#     def stability_selection(self, n_bootstrap=20, freq_threshold=0.5):
+#         all_edges = []
 
-    def pairwise_scores(self):
-        """
-        Compute pairwise causal scores using independence of residuals.
+#         for _ in range(n_bootstrap):
+#             sample_df = self.data.sample(frac=0.9, replace=True, random_state=np.random.randint(0, 1e6))
+#             est = DirectLiNGAMEstimator(
+#                 sample_df,
+#                 threshold=self.threshold,
+#                 reps=self.reps,
+#                 required_edges=self.required_edges,
+#                 forbidden_edges=self.forbidden_edges,
+#             )
+#             est.fit()
+#             model = est.get_model()
+#             all_edges.extend(model.edges())
 
-        Returns:
-            dict: Keys are tuples (X, Y), values are p-values for independence.
-        """
-        scores = {}
-        for i, X in enumerate(self.variables):
-            for j, Y in enumerate(self.variables):
-                if i == j:
-                    continue
+#         edge_counts = pd.Series(all_edges).value_counts()
+#         edge_freq = edge_counts / n_bootstrap
+#         selected_edges = edge_freq[edge_freq >= freq_threshold].index.tolist()
 
-                x = self.data[X].values.reshape(-1, 1)
-                y = self.data[Y].values.reshape(-1, 1)
+#         dag = DAG()
+#         dag.add_nodes_from(self.variables)
+#         dag.add_edges_from(selected_edges)
 
-                # Fit X → Y
-                reg_xy = Lasso(alpha=0.01).fit(x, y)
-                resid_xy = y - reg_xy.predict(x).reshape(-1, 1)
-                pval_xy = hsic_test(resid_xy, x, threshold=self.threshold, reps=self.reps)
+#         # Remove forbidden edges
+#         for (u, v) in self.forbidden_edges:
+#             if dag.has_edge(u, v):
+#                 dag.remove_edge(u, v)
 
-                # Fit Y → X
-                reg_yx = Lasso(alpha=0.01).fit(y, x)
-                resid_yx = x - reg_yx.predict(y).reshape(-1, 1)
-                pval_yx = hsic_test(resid_yx, y, threshold=self.threshold, reps=self.reps)
+#         return dag
 
-                # Higher p-value ⇒ more independent ⇒ better direction
-                direction = (X, Y) if pval_xy > pval_yx else (Y, X)
-                scores[(X, Y)] = {
-                    "X->Y_pval": round(pval_xy, 4),
-                    "Y->X_pval": round(pval_yx, 4),
-                    "preferred": direction,
-                }
+#     def _fallback_dag(self):
+#         dag = DAG()
+#         dag.add_nodes_from(self.variables)
+#         for i in self.variables:
+#             for j in self.variables:
+#                 if i != j:
+#                     dag.add_edge(i, j)
+#         return dag
 
-        return scores
-    
+#     def get_model(self):
 
-    def pairwise_graph(self, min_diff=0.0):  # You can still use min_diff if you like
-        G = nx.DiGraph()
-        G.add_nodes_from(self.variables)
+#         return self.model
 
-        scores = self.pairwise_scores()
-        for (X, Y), s in scores.items():
-            p_xy = s["X->Y_pval"]
-            p_yx = s["Y->X_pval"]
-
-            if p_xy < 0.05 and p_xy < p_yx:
-                G.add_edge(X, Y)
-            elif p_yx < 0.05 and p_yx < p_xy:
-                G.add_edge(Y, X)
-
-        return G
-
-
-
+#     def get_adjacency_matrix(self):
+#         idx = {v: i for i, v in enumerate(self.variables)}
+#         mat = np.zeros((len(idx), len(idx)))
+#         for u, v in self.model.edges():
+#             mat[idx[u], idx[v]] = 1
+#         return mat
